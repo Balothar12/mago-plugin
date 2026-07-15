@@ -11,10 +11,22 @@ import com.intellij.formatting.service.AsyncDocumentFormattingService
 import com.intellij.openapi.project.Project
 import com.intellij.formatting.service.AsyncFormattingRequest
 import com.intellij.formatting.service.FormattingService
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.util.io.FileUtil
 import com.intellij.psi.PsiFile
 import com.jetbrains.php.lang.PhpFileType
 import java.io.File
+import com.intellij.openapi.application.WriteAction
+import com.intellij.openapi.vcs.VcsFileListenerContextHelper
+import com.intellij.openapi.vfs.VfsUtil
+import com.intellij.openapi.vfs.VfsUtilCore
+import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.openapi.vfs.writeText
+import java.io.IOException
+import java.util.UUID
+import com.intellij.openapi.vfs.newvfs.ManagingFS
+import com.intellij.vcsUtil.VcsUtil
+import com.intellij.openapi.diagnostic.Logger
 
 class MagoExternalFormatter : AsyncDocumentFormattingService() {
     override fun getFeatures(): Set<FormattingService.Feature> = emptySet()
@@ -52,23 +64,53 @@ class MagoExternalFormatter : AsyncDocumentFormattingService() {
             override fun run() {
                 if (cancelled) return
 
-                val parentDir = virtualFile.parent?.path
-                if (parentDir == null) {
-                    request.onError(MagoBundle.message("formatter.name"), MagoBundle.message("formatter.error.noParentDir"))
+                val parent = virtualFile.parent
+                if (parent == null) {
+                    request.onError(
+                        MagoBundle.message("formatter.name"),
+                        MagoBundle.message("formatter.error.noParentDir")
+                    )
                     return
                 }
 
-                val tempFile = File.createTempFile(
-                    ".mago-fmt-",
-                    ".php",
-                    File(parentDir)
-                )
-                tempFile.deleteOnExit()
-                try {
-                    tempFile.writeText(request.documentText, Charsets.UTF_8)
+                val originalPath =
+                    FileUtil.toSystemIndependentName(virtualFile.path)
 
-                    val tempPath = FileUtil.toSystemIndependentName(tempFile.absolutePath)
-                    val args = MagoCliOptions.getFormatOptions(settings, project, listOf(tempPath))
+                val tempFile = WriteAction.compute<VirtualFile, IOException> {
+                    parent.createChildData(
+                        this,
+                        ".mago-fmt-${UUID.randomUUID()}.php",
+                    )
+                }
+                try {
+                    val vcsContext = project.getService(VcsFileListenerContextHelper::class.java)
+                    ignoreVcsAdditionCompat(project, tempFile)
+
+                    val lastSlash = originalPath.lastIndexOf('/')
+
+                    var tempPath = if (lastSlash >= 0) {
+                        originalPath.substring(0, lastSlash + 1) + tempFile.name
+                    } else {
+                        FileUtil.toSystemIndependentName(tempFile.path)
+                    }
+
+                    WriteAction.run<IOException> {
+                        tempFile.setBinaryContent(
+                            request.documentText.toByteArray(Charsets.UTF_8),
+                        )
+                    }
+
+                    // ensure that there are no deferred pending VFS updates (may cause a race in 2026.2 as 
+                    // VFS writes are deferred there)
+                    flushPendingVfsUpdatesIfSupported()
+
+                    tempPath = FileUtil.toSystemIndependentName(tempFile.path)
+                    val args = MagoCliOptions.getFormatOptions(
+                        settings,
+                        project,
+                        listOf(tempPath),
+                        originalPath,
+                    )
 
                     DebugLogger.inform(
                         project,
@@ -91,12 +133,22 @@ class MagoExternalFormatter : AsyncDocumentFormattingService() {
                         return
                     }
 
-                    val formattedText = tempFile.readText(Charsets.UTF_8)
+                    tempFile.refresh(false, false)
+                    val formattedText = VfsUtilCore.loadText(tempFile)
                     request.onTextReady(formattedText)
-                } catch (e: Exception) {
-                    request.onError(MagoBundle.message("formatter.error.generic"), e.message ?: MagoBundle.message("formatter.error.unknown"))
+                } catch (t: Throwable) {
+                    logger.error("Mago formatter failed", t)
+
+                    request.onError(
+                        MagoBundle.message("formatter.error.title"),
+                        t.message ?: t::class.qualifiedName ?: t.javaClass.name ?: "Unknown formatter failure",
+                    )
                 } finally {
-                    tempFile.delete()
+                    WriteAction.run<IOException> {
+                        if (tempFile.isValid) {
+                            tempFile.delete(MagoExternalFormatter::class.java)
+                        }
+                    }
                 }
             }
 
@@ -106,6 +158,18 @@ class MagoExternalFormatter : AsyncDocumentFormattingService() {
             }
 
             override fun isRunUnderProgress(): Boolean = true
+
+            private fun flushPendingVfsUpdatesIfSupported() {
+                // flushPendingUpdates() does not exist before 2026.2, so we make sure that
+                // function actually exists before we run it
+                val managingFs = ManagingFS.getInstance()
+
+                runCatching {
+                    managingFs.javaClass
+                        .getMethod("flushPendingUpdates")
+                        .invoke(managingFs)
+                }
+            }
         }
     }
 
@@ -117,4 +181,32 @@ class MagoExternalFormatter : AsyncDocumentFormattingService() {
             LocalMagoRunner() to settings.getEffectiveToolPath(project)
         }
     }
+
+    private fun ignoreVcsAdditionCompat(
+        project: Project,
+        tempFile: VirtualFile,
+    ) {
+        val helperClass = Class.forName(
+            "com.intellij.openapi.vcs.VcsFileListenerContextHelper",
+        )
+
+        val getInstance = helperClass.getMethod(
+            "getInstance",
+            Project::class.java,
+        )
+
+        val helper = getInstance.invoke(null, project)
+
+        val ignoreAdded = helperClass.getMethod(
+            "ignoreAdded",
+            Collection::class.java,
+        )
+
+        ignoreAdded.invoke(
+            helper,
+            listOf(VcsUtil.getFilePath(tempFile)),
+        )
+    }
+
+    private val logger = Logger.getInstance(MagoExternalFormatter::class.java)
 }

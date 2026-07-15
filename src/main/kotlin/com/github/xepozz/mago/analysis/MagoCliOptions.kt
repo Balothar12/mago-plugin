@@ -36,8 +36,18 @@ object MagoCliOptions {
     fun getGuardOptionsStdin(settings: MagoProjectConfiguration, project: Project, originalFilePath: String) =
         buildOptionsForStdin(settings, project, originalFilePath, "guard", settings.guardAdditionalParameters)
 
-    fun getFormatOptions(settings: MagoProjectConfiguration, project: Project, files: Collection<String>) = buildList {
-        val resolved = resolveForFile(project, settings, files.firstOrNull() ?: "")
+    fun getFormatOptions(
+        settings: MagoProjectConfiguration,
+        project: Project,
+        files: Collection<String>,
+        resolutionFilePath: String = files.firstOrNull() ?: "",
+    ) = buildList {
+        val resolved = resolveForFile(
+            project,
+            settings,
+            resolutionFilePath,
+        )
+
         addWorkspace(resolved.workspaceDir)
         addConfig(resolved.configFile)
 

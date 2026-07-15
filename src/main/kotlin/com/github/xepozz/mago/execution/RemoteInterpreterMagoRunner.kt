@@ -3,6 +3,7 @@ package com.github.xepozz.mago.execution
 import com.intellij.execution.configurations.GeneralCommandLine
 import com.intellij.execution.process.ProcessOutput
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.util.io.FileUtil
 import com.jetbrains.php.config.interpreters.PhpInterpreter
 import com.jetbrains.php.run.remote.PhpRemoteInterpreterManager
 import java.io.File
@@ -60,24 +61,114 @@ class RemoteInterpreterMagoRunner(private val interpreter: PhpInterpreter) : Mag
      * remote interpreters (e.g.: Docker with a different mount like /opt/project) receive
      * the correct paths.
      */
-    private fun mapPathsAndGetManager(project: Project, args: List<String>): Pair<PhpRemoteInterpreterManager, List<String>>? {
+    private fun mapPathsAndGetManager(
+        project: Project,
+        args: List<String>
+    ): Pair<PhpRemoteInterpreterManager, List<String>>? {
         val manager = PhpRemoteInterpreterManager.getInstance() ?: return null
-        val pathProcessor = manager.createPathMapper(project, interpreter.phpSdkAdditionalData)
+        val pathProcessor = manager.createPathMapper(
+            project,
+            interpreter.phpSdkAdditionalData,
+        )
+
         val mappedArgs = args.map { arg ->
             when {
                 arg.startsWith("--workspace=") -> {
                     val path = arg.removePrefix("--workspace=")
-                    if (pathProcessor.canProcess(path)) "--workspace=${pathProcessor.process(path)}" else arg
+                    val normalizedPath =
+                        normalizeWslPathAgainstProject(project, path)
+
+                    if (pathProcessor.canProcess(normalizedPath)) {
+                        "--workspace=${pathProcessor.process(normalizedPath)}"
+                    } else {
+                        "--workspace=$normalizedPath"
+                    }
                 }
+
                 arg.startsWith("--config=") -> {
                     val path = arg.removePrefix("--config=")
-                    if (pathProcessor.canProcess(path)) "--config=${pathProcessor.process(path)}" else arg
+                    val normalizedPath =
+                        normalizeWslPathAgainstProject(project, path)
+
+                    if (pathProcessor.canProcess(normalizedPath)) {
+                        "--config=${pathProcessor.process(normalizedPath)}"
+                    } else {
+                        "--config=$normalizedPath"
+                    }
                 }
-                pathProcessor.canProcess(arg) -> pathProcessor.process(arg)
-                else -> arg
+
+                else -> {
+                    val normalizedPath =
+                        normalizeWslPathAgainstProject(project, arg)
+
+                    if (pathProcessor.canProcess(normalizedPath)) {
+                        pathProcessor.process(normalizedPath)
+                    } else {
+                        normalizedPath
+                    }
+                }
             }
         }
+
         return manager to mappedArgs
+    }
+
+    private fun normalizeWslPathAgainstProject(
+        project: Project,
+        path: String,
+    ): String {
+        val basePath = project.basePath ?: return path
+
+        val normalizedPath = FileUtil.toSystemIndependentName(path)
+        val normalizedBasePath = FileUtil.toSystemIndependentName(basePath)
+
+        val wslRelativePath = extractWslRelativePath(normalizedPath)
+            ?: return path
+
+        val baseWslRelativePath = extractWslRelativePath(normalizedBasePath)
+            ?: return path
+
+        if (
+            !wslRelativePath.startsWith(
+                baseWslRelativePath,
+                ignoreCase = true,
+            )
+        ) {
+            return path
+        }
+
+        val relativePath =
+            wslRelativePath.removePrefix(baseWslRelativePath)
+                .trimStart('/')
+
+        return if (relativePath.isEmpty()) {
+            normalizedBasePath
+        } else {
+            "$normalizedBasePath/$relativePath"
+        }
+    }
+
+    private fun extractWslRelativePath(path: String): String? {
+        val normalized = path.replace('\\', '/')
+
+        val remainder = when {
+            normalized.startsWith("//wsl$/", ignoreCase = true) ->
+                normalized.substring("//wsl$/".length)
+
+            normalized.startsWith("//wsl.localhost/", ignoreCase = true) ->
+                normalized.substring("//wsl.localhost/".length)
+
+            else -> return null
+        }
+
+        val separator = remainder.indexOf('/')
+
+        // Drop the distribution name.
+        return if (separator >= 0) {
+            remainder.substring(separator + 1)
+        } else {
+            ""
+        }
     }
 
     private fun errorOutput(message: String, exitCode: Int = -1): ProcessOutput {
